@@ -9,7 +9,6 @@ import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +25,13 @@ import static com.fourwt.mailconnector.MailModels.DraftRequest;
  * entdecken und aufrufen kann. Version 0.1 stellt nur Suchen, Lesen und das
  * Erzeugen von Entwürfen bereit.</p>
  *
+ * <p>Der Server unterstützt bewusst beide derzeit relevanten MCP-Lebenszyklen:</p>
+ * <ul>
+ *   <li><strong>Legacy bis 2025-11-25:</strong> {@code initialize}-Handshake.</li>
+ *   <li><strong>Modern 2026-07-28:</strong> stateless, {@code server/discover}
+ *       und Protokollinformationen in jedem Request.</li>
+ * </ul>
+ *
  * <p>Der Server verwendet absichtlich den im JDK enthaltenen {@link HttpServer}.
  * Ein zusätzliches Webframework würde in diesem kleinen Lernprojekt die
  * grundlegende MCP-Mechanik eher verdecken.</p>
@@ -35,16 +41,35 @@ import static com.fourwt.mailconnector.MailModels.DraftRequest;
  */
 public final class McpHttpServer implements AutoCloseable {
 
-    /*
-     * MCP-Clients teilen beim Handshake ihre Protokollversion mit.
-     * Wir antworten mit einer unterstützten Version.
+    /**
+     * Moderne MCP-Revision.
+     *
+     * <p>Diese Revision wird nicht über {@code initialize} ausgehandelt.
+     * Sie wird in jedem Request über {@code _meta} und bei HTTP zusätzlich
+     * über den Header {@code MCP-Protocol-Version} angegeben.</p>
      */
-    private static final String LATEST_PROTOCOL = "2026-07-28";
-    private static final Set<String> SUPPORTED_PROTOCOLS = Set.of(
-            "2026-07-28",
+    static final String MODERN_PROTOCOL = "2026-07-28";
+
+    /**
+     * Neueste von uns unterstützte Legacy-Revision.
+     */
+    static final String LATEST_LEGACY_PROTOCOL = "2025-11-25";
+
+    /**
+     * Versionen, die noch den klassischen initialize-Handshake verwenden.
+     */
+    private static final Set<String> LEGACY_PROTOCOLS = Set.of(
+            "2025-11-25",
             "2025-06-18",
             "2025-03-26"
     );
+
+    private static final String META_PROTOCOL_VERSION =
+            "io.modelcontextprotocol/protocolVersion";
+    private static final String META_CLIENT_CAPABILITIES =
+            "io.modelcontextprotocol/clientCapabilities";
+    private static final String META_SERVER_INFO =
+            "io.modelcontextprotocol/serverInfo";
 
     private final MailGateway mailGateway;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -61,6 +86,7 @@ public final class McpHttpServer implements AutoCloseable {
     public McpHttpServer(MailGateway mailGateway, String bindAddress, int port) throws IOException {
         this.mailGateway = mailGateway;
         this.httpServer = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
+
         // Java-21-Virtual-Threads eignen sich gut für blockierende I/O wie
         // HTTP und IMAP und vermeiden einen schweren klassischen Thread-Pool.
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -87,7 +113,12 @@ public final class McpHttpServer implements AutoCloseable {
     /**
      * Verarbeitet eine JSON-RPC-Anfrage unabhängig vom HTTP-Transport.
      *
-     * <p>Diese Trennung macht die MCP-Logik ohne echten TCP-Port testbar.</p>
+     * <p>Diese Trennung macht die MCP-Logik ohne echten TCP-Port testbar.
+     * Die HTTP-spezifische Spiegelung in Header wird zusätzlich in
+     * {@link #handleHttp(HttpExchange)} geprüft.</p>
+     *
+     * @param request vollständige JSON-RPC-Anfrage
+     * @return JSON-RPC-Antwort oder {@code null} bei einer Notification
      */
     JsonNode handleRpc(JsonNode request) {
         JsonNode id = request.get("id");
@@ -99,21 +130,41 @@ public final class McpHttpServer implements AutoCloseable {
             return null;
         }
 
+        boolean modern = isModernRequest(request);
+
         try {
+            if (modern) {
+                validateModernRequestMetadata(request);
+            }
+
             return switch (method) {
-                case "initialize" -> success(id, initialize(request.path("params")));
-                case "ping" -> success(id, mapper.createObjectNode());
-                case "tools/list" -> success(id, toolsList());
-                case "tools/call" -> success(id, callTool(request.path("params")));
+                case "server/discover" -> modern
+                        ? success(id, discover(), true)
+                        : error(id, -32601, "Method not found: " + method);
+                case "initialize" -> modern
+                        ? error(id, -32601, "Method not found in modern MCP: " + method)
+                        : success(id, initializeLegacy(request.path("params")), false);
+                case "ping" -> modern
+                        ? error(id, -32601, "Method not found in modern MCP: " + method)
+                        : success(id, mapper.createObjectNode(), false);
+                case "tools/list" -> success(id, toolsList(modern), modern);
+                case "tools/call" -> success(id, callTool(request.path("params")), modern);
                 default -> error(id, -32601, "Method not found: " + method);
             };
+        } catch (IllegalArgumentException e) {
+            return error(id, -32602, e.getMessage());
         } catch (Exception e) {
-            return error(id, -32603, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            return error(id, -32603,
+                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
         }
     }
 
     /**
      * Dünne HTTP-Transportebene um die JSON-RPC-Verarbeitung.
+     *
+     * <p>Die Revision 2026-07-28 spiegelt bestimmte Daten aus dem JSON-Body in
+     * HTTP-Header. Das ermöglicht Routing und Sicherheitsprüfungen, ohne dass
+     * vorgeschaltete Infrastruktur zuerst JSON parsen muss.</p>
      */
     private void handleHttp(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
@@ -131,7 +182,23 @@ public final class McpHttpServer implements AutoCloseable {
             return;
         }
 
-        String method = request.path("method").asText("");
+        /*
+         * Moderne Requests müssen ihre Routing-Informationen sowohl im Body
+         * als auch in den HTTP-Headern tragen. Bei Abweichungen antworten wir
+         * mit HTTP 400 und einem MCP-Protokollfehler.
+         */
+        if (isModernHttpRequest(exchange, request)) {
+            String mirrorError = validateModernHttpMirrors(exchange, request);
+            if (mirrorError != null) {
+                writeJson(exchange, 400, error(
+                        request.get("id"),
+                        -32020,
+                        mirrorError
+                ));
+                return;
+            }
+        }
+
         JsonNode response = handleRpc(request);
 
         if (response == null) {
@@ -140,10 +207,18 @@ public final class McpHttpServer implements AutoCloseable {
             return;
         }
 
-        // Manche Clients prüfen zuerst "server/discover". Eine saubere
-        // Method-not-found-Antwort mit HTTP 404 erlaubt danach den normalen
-        // MCP-Handshake über "initialize".
-        int status = "server/discover".equals(method) ? 404 : 200;
+        /*
+         * JSON-RPC-Fehler bleiben grundsätzlich normale JSON-Antworten.
+         * Nur der spezielle Fall "unbekannte moderne Methode" darf dem Client
+         * über HTTP 404 zusätzlich signalisieren, dass die Methode nicht
+         * unterstützt wird.
+         */
+        int status = isModernRequest(request)
+                && response.has("error")
+                && response.path("error").path("code").asInt() == -32601
+                ? 404
+                : 200;
+
         writeJson(exchange, status, response);
     }
 
@@ -160,11 +235,47 @@ public final class McpHttpServer implements AutoCloseable {
     }
 
     /**
-     * MCP-Handshake: Version, Fähigkeiten und Serverinformationen.
+     * Antwort auf {@code server/discover} der modernen MCP-Ära.
+     *
+     * <p>Wichtig: {@code supportedVersions} nennt hier nur Versionen, die
+     * pro Request über {@code _meta} funktionieren. Die älteren Handshake-
+     * Versionen werden weiterhin über {@code initialize} unterstützt, aber
+     * nicht hier angeboten.</p>
      */
-    private ObjectNode initialize(JsonNode params) {
+    private ObjectNode discover() {
+        ObjectNode result = mapper.createObjectNode();
+        result.put("resultType", "complete");
+
+        ArrayNode versions = result.putArray("supportedVersions");
+        versions.add(MODERN_PROTOCOL);
+
+        ObjectNode capabilities = result.putObject("capabilities");
+        capabilities.putObject("tools").put("listChanged", false);
+
+        result.put("instructions",
+                "Read mail and create drafts only. No tool is available for sending mail.");
+
+        // Konservative Cache-Hinweise: Die Antwort darf gespeichert werden,
+        // gilt aber sofort wieder als veraltet und ist nicht zwischen Nutzern teilbar.
+        result.put("ttlMs", 0);
+        result.put("cacheScope", "private");
+
+        addServerInfo(result);
+        return result;
+    }
+
+    /**
+     * Klassischer MCP-Handshake für Revisionen bis einschließlich 2025-11-25.
+     *
+     * <p>Ein moderner Versionsstring wie 2026-07-28 wird hier absichtlich
+     * niemals zurückgegeben. Moderne Clients benutzen stattdessen
+     * {@code server/discover}.</p>
+     */
+    private ObjectNode initializeLegacy(JsonNode params) {
         String requested = params.path("protocolVersion").asText("");
-        String protocol = SUPPORTED_PROTOCOLS.contains(requested) ? requested : LATEST_PROTOCOL;
+        String protocol = LEGACY_PROTOCOLS.contains(requested)
+                ? requested
+                : LATEST_LEGACY_PROTOCOL;
 
         ObjectNode result = mapper.createObjectNode();
         result.put("protocolVersion", protocol);
@@ -187,7 +298,7 @@ public final class McpHttpServer implements AutoCloseable {
      * <p>Die Tool-Liste ist zugleich eine technische Berechtigungsgrenze:
      * Nicht veröffentlichte Werkzeuge kann der Client nicht regulär nutzen.</p>
      */
-    private ObjectNode toolsList() {
+    private ObjectNode toolsList(boolean modern) {
         ArrayNode tools = mapper.createArrayNode();
         tools.add(searchTool());
         tools.add(readTool());
@@ -195,6 +306,13 @@ public final class McpHttpServer implements AutoCloseable {
 
         ObjectNode result = mapper.createObjectNode();
         result.set("tools", tools);
+
+        if (modern) {
+            // tools/list ist in der modernen Revision cachebar.
+            result.put("ttlMs", 0);
+            result.put("cacheScope", "private");
+        }
+
         return result;
     }
 
@@ -220,6 +338,7 @@ public final class McpHttpServer implements AutoCloseable {
                         requiredText(arguments, "folder"),
                         requiredLong(arguments, "uid")
                 );
+
                 // create_draft endet im IMAP-Gateway bei APPEND in den
                 // Entwurfsordner. Ein send_mail-Zweig existiert absichtlich nicht.
                 case "create_draft" -> mailGateway.createDraft(new DraftRequest(
@@ -241,6 +360,98 @@ public final class McpHttpServer implements AutoCloseable {
     }
 
     /**
+     * Erkennt die moderne MCP-Ära ausschließlich an der per-Request-Metadaten-
+     * Version im JSON-Body.
+     *
+     * <p>Das ist wichtig: Der Methodenname {@code server/discover} allein macht
+     * einen Request noch nicht modern. Ein Legacy-Client darf die Methode testen
+     * und muss dann sauber auf {@code initialize} zurückfallen können.</p>
+     */
+    private boolean isModernRequest(JsonNode request) {
+        return MODERN_PROTOCOL.equals(protocolVersionFromBody(request));
+    }
+
+    /**
+     * Für HTTP reicht zur Erkennung zusätzlich der Protokoll-Header.
+     * Die eigentliche Gleichheit von Header und Body wird danach geprüft.
+     */
+    private boolean isModernHttpRequest(HttpExchange exchange, JsonNode request) {
+        return MODERN_PROTOCOL.equals(header(exchange, "MCP-Protocol-Version"))
+                || isModernRequest(request);
+    }
+
+    /**
+     * Prüft die Pflichtfelder im {@code _meta}-Block eines modernen Requests.
+     */
+    private void validateModernRequestMetadata(JsonNode request) {
+        JsonNode meta = request.path("params").path("_meta");
+
+        if (!MODERN_PROTOCOL.equals(meta.path(META_PROTOCOL_VERSION).asText())) {
+            throw new IllegalArgumentException(
+                    "Modern MCP request requires _meta." + META_PROTOCOL_VERSION
+                            + "=" + MODERN_PROTOCOL);
+        }
+
+        JsonNode clientCapabilities = meta.get(META_CLIENT_CAPABILITIES);
+        if (clientCapabilities == null || !clientCapabilities.isObject()) {
+            throw new IllegalArgumentException(
+                    "Modern MCP request requires object _meta." + META_CLIENT_CAPABILITIES);
+        }
+    }
+
+    /**
+     * Prüft die für Streamable HTTP vorgeschriebene Spiegelung zwischen
+     * JSON-Body und Headern.
+     *
+     * @return {@code null} bei Erfolg, sonst eine verständliche Fehlermeldung
+     */
+    private String validateModernHttpMirrors(HttpExchange exchange, JsonNode request) {
+        String bodyVersion = protocolVersionFromBody(request);
+        String headerVersion = header(exchange, "MCP-Protocol-Version");
+        if (!MODERN_PROTOCOL.equals(bodyVersion) || !MODERN_PROTOCOL.equals(headerVersion)) {
+            return "MCP-Protocol-Version header must mirror _meta protocolVersion";
+        }
+
+        String method = request.path("method").asText("");
+        String headerMethod = header(exchange, "Mcp-Method");
+        if (!method.equals(headerMethod)) {
+            return "Mcp-Method header must mirror JSON-RPC method";
+        }
+
+        if ("tools/call".equals(method)) {
+            String bodyName = request.path("params").path("name").asText("");
+            String headerName = header(exchange, "Mcp-Name");
+            if (bodyName.isBlank() || !bodyName.equals(headerName)) {
+                return "Mcp-Name header must mirror params.name for tools/call";
+            }
+        }
+
+        return null;
+    }
+
+    private String protocolVersionFromBody(JsonNode request) {
+        return request.path("params")
+                .path("_meta")
+                .path(META_PROTOCOL_VERSION)
+                .asText("");
+    }
+
+    private static String header(HttpExchange exchange, String name) {
+        return exchange.getRequestHeaders().getFirst(name);
+    }
+
+    /**
+     * Fügt die in der modernen Revision vorgeschriebene Serveridentität in
+     * den {@code _meta}-Block eines Resultats ein.
+     */
+    private void addServerInfo(ObjectNode result) {
+        ObjectNode meta = result.withObject("/_meta");
+        ObjectNode serverInfo = meta.putObject(META_SERVER_INFO);
+        serverInfo.put("name", "KI-Mail-Connector");
+        serverInfo.put("version", "0.1.0");
+    }
+
+    /**
      * Definiert das JSON-Schema für search_mail.
      */
     private ObjectNode searchTool() {
@@ -253,14 +464,13 @@ public final class McpHttpServer implements AutoCloseable {
                         "offset", integerProperty("Result offset for paging. Default 0.", 0, null)
                 ));
 
-        ObjectNode tool = tool(
+        return tool(
                 "search_mail",
                 "Search or list mail. With no query it lists recent messages. With no folder it searches all readable IMAP folders.",
                 schema,
                 true,
                 true
         );
-        return tool;
     }
 
     /**
@@ -389,7 +599,22 @@ public final class McpHttpServer implements AutoCloseable {
         return node;
     }
 
-    private ObjectNode success(JsonNode id, JsonNode result) {
+    /**
+     * Baut eine erfolgreiche JSON-RPC-Antwort.
+     *
+     * <p>In der modernen Ära muss jedes Resultat {@code resultType} und die
+     * Serveridentität im Resultat-{@code _meta} tragen.</p>
+     */
+    private ObjectNode success(JsonNode id, JsonNode rawResult, boolean modern) {
+        ObjectNode result = rawResult.deepCopy();
+
+        if (modern) {
+            if (!result.has("resultType")) {
+                result.put("resultType", "complete");
+            }
+            addServerInfo(result);
+        }
+
         ObjectNode response = mapper.createObjectNode();
         response.put("jsonrpc", "2.0");
         response.set("id", id);
@@ -413,7 +638,9 @@ public final class McpHttpServer implements AutoCloseable {
 
     private static String text(JsonNode node, String field) {
         JsonNode value = node.get(field);
-        return value == null || value.isNull() || value.asText().isBlank() ? null : value.asText().trim();
+        return value == null || value.isNull() || value.asText().isBlank()
+                ? null
+                : value.asText().trim();
     }
 
     private static String textOrEmpty(JsonNode node, String field) {
@@ -432,7 +659,8 @@ public final class McpHttpServer implements AutoCloseable {
     private static long requiredLong(JsonNode node, String field) {
         JsonNode value = node.get(field);
         if (value == null || !value.canConvertToLong()) {
-            throw new IllegalArgumentException("Missing or invalid required argument: " + field);
+            throw new IllegalArgumentException(
+                    "Missing or invalid required argument: " + field);
         }
         return value.asLong();
     }
@@ -455,7 +683,8 @@ public final class McpHttpServer implements AutoCloseable {
         List<String> result = new ArrayList<>();
         for (JsonNode value : node) {
             if (!value.isTextual() || value.asText().isBlank()) {
-                throw new IllegalArgumentException("Email address entries must be non-empty strings");
+                throw new IllegalArgumentException(
+                        "Email address entries must be non-empty strings");
             }
             result.add(value.asText().trim());
         }
