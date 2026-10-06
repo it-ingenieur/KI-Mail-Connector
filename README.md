@@ -89,7 +89,11 @@ Binärdaten der Anhänge werden noch nicht übertragen.
 
 MCP – Model Context Protocol – ermöglicht einem KI-Client, Werkzeuge eines externen Servers zu entdecken und aufzurufen.
 
-Der Ablauf ist vereinfacht:
+### Zwei Protokoll-Ären
+
+Das Projekt unterstützt bewusst beide derzeit relevanten MCP-Lebenszyklen.
+
+Legacy bis einschließlich `2025-11-25`:
 
 ```text
 initialize
@@ -99,9 +103,60 @@ tools/list
 tools/call
 ```
 
-Der `McpHttpServer` implementiert diese kleine Teilmenge über JSON-RPC.
+Modern ab `2026-07-28`:
 
-Wichtig für dieses Projekt: Die Tool-Liste ist zugleich eine Berechtigungsgrenze. Da kein `send_mail` veröffentlicht wird, gibt es für ChatGPT heute keinen regulären Versandaufruf.
+```text
+server/discover
+    |
+tools/list
+    |
+tools/call
+```
+
+Der wesentliche Unterschied: Die moderne Revision besitzt keinen dauerhaften
+Initialize-Handshake und keine MCP-Session mehr. Jeder Request trägt seine
+Protokollversion und Client-Capabilities im `_meta`-Block selbst.
+
+Bei Streamable HTTP werden wichtige Routing-Informationen zusätzlich in Header
+gespiegelt:
+
+```text
+MCP-Protocol-Version
+Mcp-Method
+Mcp-Name            (z. B. bei tools/call)
+```
+
+Der `McpHttpServer` prüft diese Spiegelung bei modernen HTTP-Requests.
+
+### Warum server/discover nur 2026-07-28 meldet
+
+`server/discover` gehört selbst zur modernen MCP-Ära. Deshalb meldet
+`supportedVersions` nur Revisionen, die pro Request funktionieren.
+
+Die Legacy-Versionen bleiben trotzdem unterstützt. Sie werden über
+`initialize` ausgehandelt und deshalb nicht in `server/discover` angeboten.
+
+### Moderne Resultate
+
+Resultate der Revision `2026-07-28` enthalten zusätzlich:
+
+- `resultType: "complete"`
+- Serveridentität in `_meta["io.modelcontextprotocol/serverInfo"]`
+- bei cachebaren Listen/Discovery-Antworten `ttlMs` und `cacheScope`
+
+Für dieses kleine Projekt verwenden wir konservativ:
+
+```text
+ttlMs      = 0
+cacheScope = private
+```
+
+Damit darf ein Client die Antwort technisch speichern, betrachtet sie aber
+sofort wieder als veraltet und teilt sie nicht zwischen verschiedenen Nutzern.
+
+Wichtig für dieses Projekt: Die Tool-Liste ist zugleich eine Berechtigungsgrenze.
+Da kein `send_mail` veröffentlicht wird, gibt es keinen regulären MCP-Aufruf
+zum Versenden einer Mail.
 
 ## Abhängigkeiten
 
@@ -181,14 +236,43 @@ FakeMailGateway
 
 Das Fake implementiert dasselbe `MailGateway`-Interface wie der reale IMAP-Adapter, führt aber keinerlei Netzwerkzugriffe aus.
 
-## Nächster praktischer Schritt
+## Aktueller Teststand
 
-Nach dem Build wird ein dediziertes Testkonto konfiguriert. Dann folgen nacheinander:
+Gegen ein reales dediziertes Mailkonto wurden bereits erfolgreich geprüft:
 
 1. IMAPS-Verbindung,
-2. Ordner und Mails lesen,
-3. konkrete Mail per UID lesen,
-4. Entwurf erzeugen,
-5. Entwurf mit einem normalen Mailclient kontrollieren.
+2. Suche im Posteingang,
+3. Lesen einer Nachricht über Ordner + UID,
+4. Plain-Text- und HTML-MIME-Inhalte,
+5. Erkennung von PDF- und vCard-Anhängen,
+6. Lesen ohne Änderung des IMAP-Flags `\\Seen`,
+7. Erzeugen eines Entwurfs im Drafts-Ordner.
 
-Erst danach ist eine Erweiterung sinnvoll.
+Zusätzlich prüft die CI beide MCP-Lebenszyklen mit Unit-Tests.
+
+## Moderne MCP-Anfrage per curl
+
+Ein `server/discover`-Aufruf für die Revision `2026-07-28` sieht über HTTP
+beispielsweise so aus:
+
+```bash
+curl -s \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":"discover-1",
+    "method":"server/discover",
+    "params":{
+      "_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+      }
+    }
+  }' \
+  http://127.0.0.1:8080/mcp
+```
+
+Ein älterer Client kann weiterhin den klassischen `initialize`-Handshake
+verwenden.
