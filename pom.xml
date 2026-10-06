@@ -8,15 +8,27 @@
     <artifactId>ki-mail-connector</artifactId>
     <version>0.1.0-SNAPSHOT</version>
     <name>KI-Mail-Connector</name>
-    <description>Java connector project for AI-assisted mail integration.</description>
+    <description>Minimal IMAP/MCP connector for reading mail and creating drafts.</description>
 
     <properties>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.11.4</junit.version>
+        <jackson.version>2.22.3</jackson.version>
+        <angus-mail.version>2.0.3</angus-mail.version>
     </properties>
 
     <dependencies>
+        <dependency>
+            <groupId>org.eclipse.angus</groupId>
+            <artifactId>jakarta.mail</artifactId>
+            <version>${angus-mail.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -30,12 +42,12 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
+                <version>3.14.1</version>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.5.2</version>
+                <version>3.5.4</version>
             </plugin>
         </plugins>
     </build>
