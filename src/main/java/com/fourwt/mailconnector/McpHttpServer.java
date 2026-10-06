@@ -103,6 +103,18 @@ public final class McpHttpServer implements AutoCloseable {
         writeJson(exchange, status, response);
     }
 
+    private void writeJson(HttpExchange exchange, int status, JsonNode response) throws IOException {
+        byte[] body = mapper.writeValueAsBytes(response);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(status, body.length);
+        try (var output = exchange.getResponseBody()) {
+            output.write(body);
+        } finally {
+            exchange.close();
+        }
+    }
+
     private ObjectNode initialize(JsonNode params) {
         String requested = params.path("protocolVersion").asText("");
         String protocol = SUPPORTED_PROTOCOLS.contains(requested) ? requested : LATEST_PROTOCOL;
