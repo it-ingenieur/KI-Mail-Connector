@@ -19,8 +19,26 @@ import java.util.concurrent.Executors;
 
 import static com.fourwt.mailconnector.MailModels.DraftRequest;
 
+/**
+ * Minimaler MCP-Server über HTTP und JSON-RPC.
+ *
+ * <p>MCP (Model Context Protocol) beschreibt, wie ein KI-Client Werkzeuge
+ * entdecken und aufrufen kann. Version 0.1 stellt nur Suchen, Lesen und das
+ * Erzeugen von Entwürfen bereit.</p>
+ *
+ * <p>Der Server verwendet absichtlich den im JDK enthaltenen {@link HttpServer}.
+ * Ein zusätzliches Webframework würde in diesem kleinen Lernprojekt die
+ * grundlegende MCP-Mechanik eher verdecken.</p>
+ *
+ * <p><strong>Sicherheitsgrenze:</strong> Ein {@code send_mail}-Tool wird nicht
+ * registriert und kann daher vom MCP-Client nicht regulär aufgerufen werden.</p>
+ */
 public final class McpHttpServer implements AutoCloseable {
 
+    /*
+     * MCP-Clients teilen beim Handshake ihre Protokollversion mit.
+     * Wir antworten mit einer unterstützten Version.
+     */
     private static final String LATEST_PROTOCOL = "2026-07-28";
     private static final Set<String> SUPPORTED_PROTOCOLS = Set.of(
             "2026-07-28",
@@ -33,28 +51,50 @@ public final class McpHttpServer implements AutoCloseable {
     private final HttpServer httpServer;
     private final ExecutorService executor;
 
+    /**
+     * Erstellt den lokalen MCP-HTTP-Server.
+     *
+     * @param mailGateway abstrahierter Mailzugriff
+     * @param bindAddress Bind-Adresse, standardmäßig 127.0.0.1
+     * @param port TCP-Port, standardmäßig 8080
+     */
     public McpHttpServer(MailGateway mailGateway, String bindAddress, int port) throws IOException {
         this.mailGateway = mailGateway;
         this.httpServer = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
+        // Java-21-Virtual-Threads eignen sich gut für blockierende I/O wie
+        // HTTP und IMAP und vermeiden einen schweren klassischen Thread-Pool.
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
         this.httpServer.setExecutor(executor);
         this.httpServer.createContext("/mcp", this::handleHttp);
     }
 
+    /**
+     * Startet die Annahme von HTTP-Anfragen.
+     */
     public void start() {
         httpServer.start();
     }
 
+    /**
+     * Beendet HTTP-Server und Executor.
+     */
     @Override
     public void close() {
         httpServer.stop(0);
         executor.shutdownNow();
     }
 
+    /**
+     * Verarbeitet eine JSON-RPC-Anfrage unabhängig vom HTTP-Transport.
+     *
+     * <p>Diese Trennung macht die MCP-Logik ohne echten TCP-Port testbar.</p>
+     */
     JsonNode handleRpc(JsonNode request) {
         JsonNode id = request.get("id");
         String method = request.path("method").asText("");
 
+        // JSON-RPC-Nachrichten ohne id sind Notifications.
+        // Auf Notifications wird keine Antwort gesendet.
         if (id == null || id.isNull()) {
             return null;
         }
@@ -72,6 +112,9 @@ public final class McpHttpServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Dünne HTTP-Transportebene um die JSON-RPC-Verarbeitung.
+     */
     private void handleHttp(HttpExchange exchange) throws IOException {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             exchange.getResponseHeaders().set("Allow", "POST");
@@ -97,8 +140,9 @@ public final class McpHttpServer implements AutoCloseable {
             return;
         }
 
-        // New OpenAI clients may probe server/discover first. A standards-compliant
-        // method-not-found response with HTTP 404 lets them fall back to initialize.
+        // Manche Clients prüfen zuerst "server/discover". Eine saubere
+        // Method-not-found-Antwort mit HTTP 404 erlaubt danach den normalen
+        // MCP-Handshake über "initialize".
         int status = "server/discover".equals(method) ? 404 : 200;
         writeJson(exchange, status, response);
     }
@@ -115,6 +159,9 @@ public final class McpHttpServer implements AutoCloseable {
         }
     }
 
+    /**
+     * MCP-Handshake: Version, Fähigkeiten und Serverinformationen.
+     */
     private ObjectNode initialize(JsonNode params) {
         String requested = params.path("protocolVersion").asText("");
         String protocol = SUPPORTED_PROTOCOLS.contains(requested) ? requested : LATEST_PROTOCOL;
@@ -134,6 +181,12 @@ public final class McpHttpServer implements AutoCloseable {
         return result;
     }
 
+    /**
+     * Liefert die Werkzeugbeschreibung für den MCP-Client.
+     *
+     * <p>Die Tool-Liste ist zugleich eine technische Berechtigungsgrenze:
+     * Nicht veröffentlichte Werkzeuge kann der Client nicht regulär nutzen.</p>
+     */
     private ObjectNode toolsList() {
         ArrayNode tools = mapper.createArrayNode();
         tools.add(searchTool());
@@ -145,6 +198,12 @@ public final class McpHttpServer implements AutoCloseable {
         return result;
     }
 
+    /**
+     * Dispatcht einen MCP-Toolaufruf auf das {@link MailGateway}.
+     *
+     * <p>Diese Schicht übersetzt nur JSON in Java-Typen und zurück.
+     * IMAP-Details bleiben vollständig im Gateway.</p>
+     */
     private ObjectNode callTool(JsonNode params) {
         String name = params.path("name").asText("");
         JsonNode arguments = params.path("arguments");
@@ -161,6 +220,8 @@ public final class McpHttpServer implements AutoCloseable {
                         requiredText(arguments, "folder"),
                         requiredLong(arguments, "uid")
                 );
+                // create_draft endet im IMAP-Gateway bei APPEND in den
+                // Entwurfsordner. Ein send_mail-Zweig existiert absichtlich nicht.
                 case "create_draft" -> mailGateway.createDraft(new DraftRequest(
                         strings(arguments.get("to")),
                         strings(arguments.get("cc")),
@@ -179,6 +240,9 @@ public final class McpHttpServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Definiert das JSON-Schema für search_mail.
+     */
     private ObjectNode searchTool() {
         ObjectNode schema = objectSchema();
         schema.putObject("properties")
@@ -199,6 +263,9 @@ public final class McpHttpServer implements AutoCloseable {
         return tool;
     }
 
+    /**
+     * Definiert das JSON-Schema für read_mail.
+     */
     private ObjectNode readTool() {
         ObjectNode schema = objectSchema();
         schema.putObject("properties")
@@ -219,6 +286,12 @@ public final class McpHttpServer implements AutoCloseable {
         );
     }
 
+    /**
+     * Definiert das JSON-Schema für create_draft.
+     *
+     * <p>{@code readOnlyHint=false}, weil das Speichern eines Entwurfs den
+     * Zustand des Mailkontos verändert, obwohl keine Mail versendet wird.</p>
+     */
     private ObjectNode createDraftTool() {
         ObjectNode schema = objectSchema();
         ObjectNode properties = schema.putObject("properties");
@@ -254,6 +327,7 @@ public final class McpHttpServer implements AutoCloseable {
         tool.put("description", description);
         tool.set("inputSchema", inputSchema);
 
+        // MCP-Annotations beschreiben Seiteneffekte eines Werkzeugs.
         ObjectNode annotations = tool.putObject("annotations");
         annotations.put("readOnlyHint", readOnly);
         annotations.put("destructiveHint", false);
@@ -262,6 +336,9 @@ public final class McpHttpServer implements AutoCloseable {
         return tool;
     }
 
+    /**
+     * Verpackt ein Java-Ergebnis in das MCP-Content-Format.
+     */
     private ObjectNode toolResult(Object value, boolean isError) {
         ObjectNode result = mapper.createObjectNode();
         ArrayNode content = result.putArray("content");
@@ -365,6 +442,9 @@ public final class McpHttpServer implements AutoCloseable {
         return value == null || !value.isInt() ? defaultValue : value.asInt();
     }
 
+    /**
+     * Validiert ein JSON-Array als Liste nichtleerer Strings.
+     */
     private static List<String> strings(JsonNode node) {
         if (node == null || node.isNull()) {
             return List.of();

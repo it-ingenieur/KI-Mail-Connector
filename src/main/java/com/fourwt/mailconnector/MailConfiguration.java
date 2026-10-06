@@ -2,6 +2,15 @@ package com.fourwt.mailconnector;
 
 import java.util.Map;
 
+/**
+ * Unveränderliche Laufzeitkonfiguration des Connectors.
+ *
+ * <p>Ein Java-{@code record} eignet sich hier gut, weil die Klasse ausschließlich
+ * Daten transportiert. Der Compiler erzeugt Konstruktor und Zugriffsmethoden automatisch.</p>
+ *
+ * <p><strong>Sicherheitsprinzip:</strong> Das Passwort wird nur aus der
+ * Prozessumgebung gelesen und niemals in Git gespeichert.</p>
+ */
 public record MailConfiguration(
         String imapHost,
         int imapPort,
@@ -12,6 +21,13 @@ public record MailConfiguration(
         String mcpBind,
         int mcpPort
 ) {
+    /**
+     * Erzeugt die Konfiguration aus Umgebungsvariablen.
+     *
+     * <p>Die Map wird als Parameter übergeben, statt innerhalb der Methode direkt
+     * {@code System.getenv()} aufzurufen. Das macht die Methode deterministisch
+     * und später sehr einfach testbar.</p>
+     */
     public static MailConfiguration fromEnvironment(Map<String, String> env) {
         String username = required(env, "MAIL_USERNAME");
         return new MailConfiguration(
@@ -26,6 +42,9 @@ public record MailConfiguration(
         );
     }
 
+    /**
+     * Liest einen zwingend notwendigen String-Wert.
+     */
     private static String required(Map<String, String> env, String name) {
         String value = env.get(name);
         if (value == null || value.isBlank()) {
@@ -34,11 +53,17 @@ public record MailConfiguration(
         return value.trim();
     }
 
+    /**
+     * Liest einen optionalen String-Wert und verwendet sonst den Standardwert.
+     */
     private static String value(Map<String, String> env, String name, String defaultValue) {
         String value = env.get(name);
         return value == null || value.isBlank() ? defaultValue : value.trim();
     }
 
+    /**
+     * Liest einen optionalen Integer-Wert und meldet ungültige Werte ausdrücklich.
+     */
     private static int integer(Map<String, String> env, String name, int defaultValue) {
         String value = env.get(name);
         if (value == null || value.isBlank()) {

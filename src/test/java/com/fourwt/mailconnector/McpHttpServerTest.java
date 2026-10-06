@@ -14,10 +14,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Unit-Tests der MCP-Schicht ohne realen Mailserver.
+ *
+ * <p>Das FakeMailGateway zeigt ein wichtiges Testprinzip: Die zu testende
+ * Schicht erhält eine kontrollierte Ersatzimplementierung ihrer Abhängigkeit.
+ * So testen wir MCP-Parsing und -Dispatching ohne Netzwerkzugriff.</p>
+ */
 class McpHttpServerTest {
 
     private final ObjectMapper mapper = new ObjectMapper();
 
+    /**
+     * Sicherheitsrelevanter Regressionstest:
+     * Die öffentliche Tool-Liste darf kein send_mail enthalten.
+     */
     @Test
     void exposesReadAndDraftToolsButNoSendTool() throws Exception {
         try (McpHttpServer server = new McpHttpServer(new FakeMailGateway(), "127.0.0.1", 0)) {
@@ -33,6 +44,9 @@ class McpHttpServerTest {
         }
     }
 
+    /**
+     * Prüft, dass create_draft nur an das MailGateway delegiert.
+     */
     @Test
     void createDraftDelegatesWithoutSending() throws Exception {
         FakeMailGateway gateway = new FakeMailGateway();
@@ -59,6 +73,10 @@ class McpHttpServerTest {
         }
     }
 
+    /**
+     * Test-Double: speichert den letzten Entwurfsauftrag nur im Speicher.
+     * Es findet keinerlei Mailserver- oder Netzwerkzugriff statt.
+     */
     private static final class FakeMailGateway implements MailGateway {
         private DraftRequest lastDraft;
 
