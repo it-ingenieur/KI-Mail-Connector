@@ -20,6 +20,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Das FakeMailGateway zeigt ein wichtiges Testprinzip: Die zu testende
  * Schicht erhält eine kontrollierte Ersatzimplementierung ihrer Abhängigkeit.
  * So testen wir MCP-Parsing und -Dispatching ohne Netzwerkzugriff.</p>
+ *
+ * <p>Zusätzlich sichern die Tests beide MCP-Lebenszyklen ab:</p>
+ * <ul>
+ *   <li>Legacy bis 2025-11-25 mit initialize-Handshake.</li>
+ *   <li>Modern 2026-07-28 mit server/discover und per-Request-_meta.</li>
+ * </ul>
  */
 class McpHttpServerTest {
 
@@ -31,7 +37,9 @@ class McpHttpServerTest {
      */
     @Test
     void exposesReadAndDraftToolsButNoSendTool() throws Exception {
-        try (McpHttpServer server = new McpHttpServer(new FakeMailGateway(), "127.0.0.1", 0)) {
+        try (McpHttpServer server = new McpHttpServer(
+                new FakeMailGateway(), "127.0.0.1", 0)) {
+
             JsonNode response = server.handleRpc(mapper.readTree("""
                     {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
                     """));
@@ -50,7 +58,10 @@ class McpHttpServerTest {
     @Test
     void createDraftDelegatesWithoutSending() throws Exception {
         FakeMailGateway gateway = new FakeMailGateway();
-        try (McpHttpServer server = new McpHttpServer(gateway, "127.0.0.1", 0)) {
+
+        try (McpHttpServer server = new McpHttpServer(
+                gateway, "127.0.0.1", 0)) {
+
             JsonNode response = server.handleRpc(mapper.readTree("""
                     {
                       "jsonrpc":"2.0",
@@ -70,6 +81,144 @@ class McpHttpServerTest {
             assertEquals("recipient@example.com", gateway.lastDraft.to().getFirst());
             assertEquals("Test", gateway.lastDraft.subject());
             assertFalse(response.path("result").path("isError").asBoolean());
+        }
+    }
+
+    /**
+     * Ein moderner Client fragt die Fähigkeiten über server/discover ab.
+     *
+     * <p>supportedVersions darf hier nur moderne, pro Request transportierbare
+     * Revisionen nennen. Legacy-Versionen werden weiterhin über initialize
+     * ausgehandelt.</p>
+     */
+    @Test
+    void modernDiscoverAdvertises20260728AndServerInfo() throws Exception {
+        try (McpHttpServer server = new McpHttpServer(
+                new FakeMailGateway(), "127.0.0.1", 0)) {
+
+            JsonNode response = server.handleRpc(mapper.readTree("""
+                    {
+                      "jsonrpc":"2.0",
+                      "id":"discover-1",
+                      "method":"server/discover",
+                      "params":{
+                        "_meta":{
+                          "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                          "io.modelcontextprotocol/clientCapabilities":{}
+                        }
+                      }
+                    }
+                    """));
+
+            JsonNode result = response.path("result");
+
+            assertEquals("complete", result.path("resultType").asText());
+            assertEquals(1, result.path("supportedVersions").size());
+            assertEquals("2026-07-28",
+                    result.path("supportedVersions").get(0).asText());
+            assertTrue(result.path("capabilities").has("tools"));
+            assertEquals(0, result.path("ttlMs").asInt());
+            assertEquals("private", result.path("cacheScope").asText());
+            assertEquals(
+                    "KI-Mail-Connector",
+                    result.path("_meta")
+                            .path("io.modelcontextprotocol/serverInfo")
+                            .path("name")
+                            .asText()
+            );
+        }
+    }
+
+    /**
+     * Die moderne Revision trägt resultType und Serveridentität auf jedem
+     * erfolgreichen Resultat, nicht nur bei server/discover.
+     */
+    @Test
+    void modernToolsListCarriesModernResultMetadata() throws Exception {
+        try (McpHttpServer server = new McpHttpServer(
+                new FakeMailGateway(), "127.0.0.1", 0)) {
+
+            JsonNode response = server.handleRpc(mapper.readTree("""
+                    {
+                      "jsonrpc":"2.0",
+                      "id":3,
+                      "method":"tools/list",
+                      "params":{
+                        "_meta":{
+                          "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                          "io.modelcontextprotocol/clientCapabilities":{}
+                        }
+                      }
+                    }
+                    """));
+
+            JsonNode result = response.path("result");
+            assertEquals("complete", result.path("resultType").asText());
+            assertEquals(
+                    "KI-Mail-Connector",
+                    result.path("_meta")
+                            .path("io.modelcontextprotocol/serverInfo")
+                            .path("name")
+                            .asText()
+            );
+            assertTrue(result.path("tools").isArray());
+        }
+    }
+
+    /**
+     * Die moderne Revision darf nicht irrtümlich über initialize ausgehandelt
+     * werden. Ein Legacy-initialize mit modernem Versionswunsch erhält die
+     * neueste von uns unterstützte Handshake-Version zurück.
+     */
+    @Test
+    void legacyInitializeNeverNegotiatesModernProtocol() throws Exception {
+        try (McpHttpServer server = new McpHttpServer(
+                new FakeMailGateway(), "127.0.0.1", 0)) {
+
+            JsonNode response = server.handleRpc(mapper.readTree("""
+                    {
+                      "jsonrpc":"2.0",
+                      "id":4,
+                      "method":"initialize",
+                      "params":{
+                        "protocolVersion":"2026-07-28",
+                        "capabilities":{},
+                        "clientInfo":{"name":"legacy-test","version":"1.0"}
+                      }
+                    }
+                    """));
+
+            assertEquals(
+                    "2025-11-25",
+                    response.path("result").path("protocolVersion").asText()
+            );
+            assertFalse(response.path("result").has("resultType"));
+        }
+    }
+
+    /**
+     * Moderne Requests benötigen die Protokollversion und Client-Capabilities
+     * im _meta-Block.
+     */
+    @Test
+    void modernRequestRejectsMissingClientCapabilities() throws Exception {
+        try (McpHttpServer server = new McpHttpServer(
+                new FakeMailGateway(), "127.0.0.1", 0)) {
+
+            JsonNode response = server.handleRpc(mapper.readTree("""
+                    {
+                      "jsonrpc":"2.0",
+                      "id":5,
+                      "method":"tools/list",
+                      "params":{
+                        "_meta":{
+                          "io.modelcontextprotocol/protocolVersion":"2026-07-28"
+                        }
+                      }
+                    }
+                    """));
+
+            assertEquals(-32602, response.path("error").path("code").asInt());
         }
     }
 
